@@ -1,82 +1,82 @@
-import { NextResponse } from "next/server";
-import { getSupabaseAdmin } from "@/lib/supabaseServer";
+import { NextRequest, NextResponse } from "next/server";
+import Stripe from "stripe";
+import { createClient } from "@supabase/supabase-js";
 
-async function removeBeat(req: Request) {
+export async function GET(req: NextRequest) {
   try {
-    const method = req.method;
-
-    let id: string | null = null;
-    let password: string | undefined = undefined;
-
-    //
-    // 1. Extract ID + password depending on method + content type
-    //
-    if (method === "DELETE") {
-      const contentType = req.headers.get("content-type") || "";
-
-      if (contentType.includes("application/json")) {
-        const body = await req.json().catch(() => null);
-        id = body?.id ?? null;
-        password = body?.password;
-      } else {
-        const url = new URL(req.url);
-        id = url.searchParams.get("id");
-        password = url.searchParams.get("password") ?? undefined;
-      }
-    }
-
-    if (method === "POST") {
-      const body = await req.json().catch(() => null);
-      id = body?.id ?? null;
-      password = body?.password;
-    }
-
-    //
-    // 2. Admin bypass or owner password
-    //
-    if (password !== "ADMIN_BYPASS") {
-      if (!process.env.OWNER_PASSWORD || password !== process.env.OWNER_PASSWORD) {
-        return NextResponse.json(
-          { success: false, error: "Unauthorized" },
-          { status: 403 }
-        );
-      }
-    }
-
-    //
-    // 3. Validate ID
-    //
-    if (!id || typeof id !== "string") {
+    // 1. Stripe client
+    const stripeSecret = process.env.STRIPE_SECRET_KEY;
+    if (!stripeSecret) {
       return NextResponse.json(
-        { success: false, error: "Missing or invalid beat id" },
-        { status: 400 }
-      );
-    }
-
-    //
-    // 4. Delete from Supabase
-    //
-    const supabase = getSupabaseAdmin();
-    const { error } = await supabase.from("beats").delete().eq("id", id);
-
-    if (error) {
-      console.error("Supabase delete error:", error);
-      return NextResponse.json(
-        { success: false, error: error.message },
+        { error: "Stripe secret key missing" },
         { status: 500 }
       );
     }
 
-    return NextResponse.json({ success: true });
+    const stripe = new Stripe(stripeSecret, {
+      apiVersion: "2026-05-27.dahlia",
+    });
+
+    // 2. Supabase client
+    const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+    const serviceRole = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+    if (!supabaseUrl || !serviceRole) {
+      return NextResponse.json(
+        { error: "Supabase environment variables missing" },
+        { status: 500 }
+      );
+    }
+
+    const supabase = createClient(supabaseUrl, serviceRole);
+
+    // 3. Extract session ID
+    const sessionId = req.nextUrl.searchParams.get("session_id");
+
+    if (!sessionId) {
+      return NextResponse.json({ error: "Missing session_id" }, { status: 400 });
+    }
+
+    // 4. Verify Stripe session
+    const session = await stripe.checkout.sessions.retrieve(sessionId);
+
+    if (!session || session.payment_status !== "paid") {
+      return NextResponse.json(
+        { error: "Payment not verified" },
+        { status: 403 }
+      );
+    }
+
+    // 5. Extract metadata
+    const beatId = session.metadata?.beatId;
+    const fullAudioPath = session.metadata?.fullAudioPath;
+
+    if (!beatId || !fullAudioPath) {
+      return NextResponse.json(
+        { error: "Missing beat metadata" },
+        { status: 400 }
+      );
+    }
+
+    // 6. Generate signed URL
+    const { data, error } = await supabase.storage
+      .from("beats")
+      .createSignedUrl(fullAudioPath, 60 * 60);
+
+    if (error || !data?.signedUrl) {
+      return NextResponse.json(
+        { error: "Failed to generate download URL" },
+        { status: 500 }
+      );
+    }
+
+    return NextResponse.json({ url: data.signedUrl });
 
   } catch (err) {
-    console.error("Delete route error:", err);
+    console.error("Download-beat error:", err);
     return NextResponse.json(
-      { success: false, error: "Server error" },
+      { error: "Server error" },
       { status: 500 }
     );
   }
 }
-
-export const POST = removeBeat;
-export const DELETE = removeBeat;

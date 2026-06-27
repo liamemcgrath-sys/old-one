@@ -1,109 +1,82 @@
-import Stripe from "stripe";
-import { toDisplayBeat } from "@/lib/beats";
+import { NextResponse } from "next/server";
 import { getSupabaseAdmin } from "@/lib/supabaseServer";
 
-const stripeSecretKey = process.env.STRIPE_SECRET_KEY?.trim();
-
-function isLikelyStripeSecret(value: string | undefined) {
-  return Boolean(
-    value &&
-      value !== "your_stripe_key" &&
-      value !== "" &&
-      /^(sk|rk)_(live|test)_[A-Za-z0-9]+/.test(value),
-  );
-}
-
-let stripe: Stripe | null = null;
-
-if (stripeSecretKey && isLikelyStripeSecret(stripeSecretKey)) {
+async function removeBeat(req: Request) {
   try {
-    stripe = new Stripe(stripeSecretKey, {
-      apiVersion: "2026-05-27.dahlia",
-    });
-  } catch (error) {
-    console.error("Stripe initialization failed:", error);
-  }
-}
+    const method = req.method;
 
-function getBaseUrl(request: Request) {
-  const forwardedProto = request.headers.get("x-forwarded-proto");
-  const forwardedHost = request.headers.get("x-forwarded-host");
-  const host = request.headers.get("host");
+    let id: string | null = null;
+    let password: string | undefined = undefined;
 
-  if (forwardedProto && (forwardedHost || host)) {
-    return `${forwardedProto}://${forwardedHost || host}`;
-  }
+    //
+    // 1. Extract ID + password depending on method + content type
+    //
+    if (method === "DELETE") {
+      const contentType = req.headers.get("content-type") || "";
 
-  if (process.env.NEXT_PUBLIC_URL) {
-    return process.env.NEXT_PUBLIC_URL;
-  }
+      if (contentType.includes("application/json")) {
+        const body = await req.json().catch(() => null);
+        id = body?.id ?? null;
+        password = body?.password;
+      } else {
+        const url = new URL(req.url);
+        id = url.searchParams.get("id");
+        password = url.searchParams.get("password") ?? undefined;
+      }
+    }
 
-  if (process.env.VERCEL_URL) {
-    return `https://${process.env.VERCEL_URL}`;
-  }
+    if (method === "POST") {
+      const body = await req.json().catch(() => null);
+      id = body?.id ?? null;
+      password = body?.password;
+    }
 
-  return "http://localhost:3000";
-}
+    //
+    // 2. Admin bypass or owner password
+    //
+    if (password !== "ADMIN_BYPASS") {
+      if (!process.env.OWNER_PASSWORD || password !== process.env.OWNER_PASSWORD) {
+        return NextResponse.json(
+          { success: false, error: "Unauthorized" },
+          { status: 403 }
+        );
+      }
+    }
 
-export async function POST(req: Request) {
-  const body = await req.json().catch(() => null);
-  const beatId = body?.beatId;
-  const baseUrl = getBaseUrl(req);
+    //
+    // 3. Validate ID
+    //
+    if (!id || typeof id !== "string") {
+      return NextResponse.json(
+        { success: false, error: "Missing or invalid beat id" },
+        { status: 400 }
+      );
+    }
 
-  if (!beatId || typeof beatId !== "string") {
-    return Response.json({ error: "Missing beat id" }, { status: 400 });
-  }
+    //
+    // 4. Delete from Supabase
+    //
+    const supabase = getSupabaseAdmin();
+    const { error } = await supabase.from("beats").delete().eq("id", id);
 
-  const supabase = getSupabaseAdmin();
-  const { data: dbBeat, error } = await supabase
-    .from("beats")
-    .select("*")
-    .eq("id", beatId)
-    .single();
+    if (error) {
+      console.error("Supabase delete error:", error);
+      return NextResponse.json(
+        { success: false, error: error.message },
+        { status: 500 }
+      );
+    }
 
-  if (error || !dbBeat) {
-    return Response.json({ error: "Beat not found" }, { status: 404 });
-  }
+    return NextResponse.json({ success: true });
 
-  // Convert DB row → DisplayBeat
-  const beat = toDisplayBeat(dbBeat);
-  const unitAmount = Math.max(100, Math.round(beat.price * 100));
-
-  if (!stripe) {
-    return Response.json(
-      {
-        mode: "demo",
-        url: `${baseUrl}/success?mode=demo`,
-        message:
-          "Stripe is not configured yet, so checkout used the local demo fallback.",
-      },
-      { status: 200 },
+  } catch (err) {
+    console.error("Delete route error:", err);
+    return NextResponse.json(
+      { success: false, error: "Server error" },
+      { status: 500 }
     );
   }
-
-  const session = await stripe.checkout.sessions.create({
-    payment_method_types: ["card"],
-    mode: "payment",
-    line_items: [
-      {
-        price_data: {
-          currency: "usd",
-          product_data: {
-            name: beat.title,
-          },
-          unit_amount: unitAmount,
-        },
-        quantity: 1,
-      },
-    ],
-    success_url: `${baseUrl}/success?session_id={CHECKOUT_SESSION_ID}`,
-    cancel_url: `${baseUrl}/cancel`,
-    metadata: {
-      beatId: beat.id,
-      beatTitle: beat.title,
-      fullAudioPath: beat.fullAudioPath,
-    },
-  });
-
-  return Response.json({ url: session.url, sessionId: session.id });
 }
+
+export const POST = removeBeat;
+export const DELETE = removeBeat;
